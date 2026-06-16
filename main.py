@@ -10,10 +10,16 @@ from aiogram.exceptions import TelegramBadRequest
 config = configparser.ConfigParser()
 config.read('config.ini')
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 try:
     BOT_TOKEN = config['bot']['token']
     SUPER_ADMIN_ID = int(config['admin']['super_admin_id'])
-    DB_NAME = config['database'].get('db_name', 'multi_all_seeing_bot.db')
+    
+
+    raw_db_name = config['database'].get('db_name', 'multi_all_seeing_bot.db')
+    DB_NAME = os.path.join(BASE_DIR, raw_db_name)
+    
 except KeyError as e:
     raise SystemExit(f"Критическая ошибка: В файле config.ini отсутствует секция или ключ: {e}")
 
@@ -61,7 +67,10 @@ async def cmd_start(message: Message):
     
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
+    cursor.execute(
+        "INSERT OR IGNORE INTO users (user_id, username, business_connection_id) VALUES (?, ?, NULL)", 
+        (user_id, username)
+    )
     conn.commit()
     conn.close()
     
