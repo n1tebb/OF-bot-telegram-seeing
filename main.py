@@ -348,17 +348,16 @@ async def process_business_message(message: types.Message) -> None:
         logger.warning("Отсутствует business_connection_id в событии бизнес-сообщения.")
         return
 
-    if message.from_user.id != message.chat.id:
-        return
-
     # Если нет записи о владельце (business_connection_id), создаём её автоматически
     user_record = db.get_user(business_connection_id)
     if not user_record:
-        try:
-            # пытаемся взять читаемое имя из объекта сообщения
-            candidate_name = getattr(message.from_user, 'username', None) or getattr(message.chat, 'username', None) or getattr(message.from_user, 'full_name', None)
-        except Exception:
-            candidate_name = str(business_connection_id)
+        candidate_name = (
+            getattr(message.from_user, 'username', None)
+            or getattr(message.from_user, 'full_name', None)
+            or getattr(message.chat, 'username', None)
+            or getattr(message.chat, 'full_name', None)
+            or str(business_connection_id)
+        )
         db.add_user(business_connection_id, candidate_name)
         user_record = db.get_user(business_connection_id)
 
@@ -379,9 +378,6 @@ async def process_edited_business_message(message: types.Message) -> None:
     business_connection_id = getattr(message, "business_connection_id", None)
     if business_connection_id is None:
         logger.warning("Отсутствует business_connection_id в событии редактирования.")
-        return
-
-    if message.from_user.id != message.chat.id:
         return
 
     user_record = db.get_user(business_connection_id)
@@ -414,9 +410,6 @@ async def process_deleted_business_messages(message: types.Message) -> None:
     business_connection_id = getattr(message, "business_connection_id", None)
     if business_connection_id is None:
         logger.warning("Отсутствует business_connection_id в событии удаления.")
-        return
-
-    if message.from_user.id != message.chat.id:
         return
 
     user_record = db.get_user(business_connection_id)
