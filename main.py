@@ -25,6 +25,7 @@ dp = Dispatcher()
 
 
 def init_db():
+    """Гарантированное создание всех необходимых таблиц при старте"""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
@@ -32,6 +33,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
+            business_connection_id TEXT,
             status TEXT DEFAULT 'active'
         )
     """)
@@ -39,7 +41,6 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS business_cache (
             business_connection_id TEXT,
-            owner_user_id INTEGER,  -- 🌟 Новое поле для связи
             chat_id INTEGER,
             message_id INTEGER,
             author_name TEXT,
@@ -49,6 +50,7 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+    logging.info("База данных и все таблицы успешно созданы с нуля!")
 
 
 @dp.message(Command("start"))
