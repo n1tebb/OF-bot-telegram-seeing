@@ -1,252 +1,240 @@
 import configparser
-import logging
-import sqlite3
+import importlib
 import os
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, BusinessMessagesDeleted, InlineKeyboardMarkup, InlineKeyboardButton
+import sqlite3
+from pydantic import BaseModel
+import asyncio
+from typing import Union
+import logging
+from aiogram import Router, Bot, Dispatcher, F, types
 from aiogram.filters import Command
-from aiogram.exceptions import TelegramBadRequest
+from html import escape
+from datetime import datetime, timezone, timedelta
+import pytz
+
 
 config = configparser.ConfigParser()
-config.read('config.ini')
+config.read("config_example.ini")
+
+TOKEN = config["telegram"]["token"].strip('"')
+USER_ID = int(config["telegram"]["user_id"].strip('"'))
+TIMEZONE_NAME = config["timezone"]["name"].strip('"')
+timezone_local = pytz.timezone(TIMEZONE_NAME)
+LANGUAGE = config["settings"]["language"].strip('"')
+
+try:
+    language_module = importlib.import_module(f"languages.{LANGUAGE}")
+except ImportError:
+    raise ImportError(f"Language module for '{LANGUAGE}' not found.")
+
+router = Router(name=__name__)
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-try:
-    BOT_TOKEN = config['bot']['token']
-    SUPER_ADMIN_ID = int(config['admin']['super_admin_id'])
-    
-
-    raw_db_name = config['database'].get('db_name', 'multi_all_seeing_bot.db')
-    DB_NAME = os.path.join(BASE_DIR, raw_db_name)
-    
-except KeyError as e:
-    raise SystemExit(f"Критическая ошибка: В файле config.ini отсутствует секция или ключ: {e}")
+EDITED_MESSAGE_FORMAT = language_module.EDITED_MESSAGE_FORMAT
+DELETED_MESSAGE_FORMAT = language_module.DELETED_MESSAGE_FORMAT
+NEW_USER_MESSAGE_FORMAT = language_module.NEW_USER_MESSAGE_FORMAT
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-
-def init_db():
-    """Гарантированное создание всех необходимых таблиц при старте"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            business_connection_id TEXT,
-            status TEXT DEFAULT 'active'
-        )
-    """)
-    
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS business_cache (
-            business_connection_id TEXT,
-            chat_id INTEGER,
-            message_id INTEGER,
-            author_name TEXT,
-            text TEXT,
-            PRIMARY KEY (business_connection_id, chat_id, message_id)
-        )
-    """)
-    conn.commit()
-    conn.close()
-    logging.info("База данных и все таблицы успешно созданы с нуля!")
+def dict_factory(cursor, row) -> dict:
+    save_dict = {}
+    for idx, col in enumerate(cursor.description):
+        save_dict[col[0]] = row[idx]
+    return save_dict
 
 
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    """Регистрация нового бизнес-клиента в базе бота"""
-    user_id = message.from_user.id
-    username = f"@{message.from_user.username}" if message.from_user.username else "Без имени"
-    
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR IGNORE INTO users (user_id, username, business_connection_id) VALUES (?, ?, NULL)", 
-        (user_id, username)
-    )
-    conn.commit()
-    conn.close()
-    
-    await message.reply(
-        "🌟 **Бот-ассистент готов к работе!**\n\n"
-        "Чтобы бот отслеживал удаления в ваших диалогах:\n"
-        "1. Зайдите в Настройки -> Telegram для бизнеса -> Чат-боты.\n"
-        "2. Добавьте юзернейм этого бота и выберите чаты для защиты."
-    )
+def update_format(sql, parameters: dict) -> tuple[str, list]:
+    values = ", ".join([f"{item} = ?" for item in parameters])
+    sql += f" {values}"
+    return sql, list(parameters.values())
 
-@dp.business_message()
-async def handle_incoming_business_message(message: Message):
-    if not message.text:
-        return
 
-    author = message.from_user.full_name if message.from_user else "Собеседник"
-    
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    if message.from_user and message.chat.id == message.from_user.id:
-        cursor.execute("""
-            UPDATE users SET business_connection_id = ? WHERE user_id = ?
-        """, (message.business_connection_id, message.from_user.id))
+class MessageRecord(BaseModel):
+    user_id: int
+    message_id: int
+    message_text: str
+    timestamp: str
 
-    cursor.execute("""
-        INSERT OR REPLACE INTO business_cache (business_connection_id, chat_id, message_id, author_name, text)
-        VALUES (?, ?, ?, ?, ?)
-    """, (message.business_connection_id, message.chat.id, message.message_id, author, message.text))
-    conn.commit()
-    conn.close()
 
-@dp.deleted_business_messages()
-async def handle_deleted_business_messages(event: BusinessMessagesDeleted):
-    """Перехват удалений и отправка отчетов соответствующему пользователю"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+class Messagesx:
+    storage_name = "messages"
+    PATH_DATABASE = "messages.db"
 
-    for msg_id in event.message_ids:
 
-        cursor.execute("""
-            SELECT author_name, text FROM business_cache 
-            WHERE business_connection_id = ? AND chat_id = ? AND message_id = ?
-        """, (event.business_connection_id, event.chat.id, msg_id))
-        
-        result = cursor.fetchone()
+    @staticmethod
+    def create_db():
+        with sqlite3.connect(Messagesx.PATH_DATABASE) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''CREATE TABLE IF NOT EXISTS messages
+                              (id INTEGER PRIMARY KEY,
+                               user_id INTEGER,
+                               message_id INTEGER,
+                               message_text TEXT,
+                               timestamp TEXT)''')
 
-        if result:
-            author_name, old_text = result
-            
-            safe_text = old_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            
-            report_text = (
-                f"🗑 <b>В ВАШЕМ БИЗНЕС-ЧАТЕ УДАЛЕНО СООБЩЕНИЕ!</b>\n\n"
-                f"👤 <b>Отправитель:</b> {author_name}\n"
-                f"🆔 <b>ID сообщения:</b> <code>{msg_id}</code>\n\n"
-                f"📝 <b>Текст до удаления:</b>\n<i>{safe_text}</i>"
+
+    @staticmethod
+    def add(user_id: int, message_id: int, message_text: str, timestamp: str):
+        with sqlite3.connect(Messagesx.PATH_DATABASE) as con:
+            con.row_factory = dict_factory
+            con.execute(
+                f"INSERT INTO {Messagesx.storage_name} (user_id, message_id, message_text, timestamp) VALUES (?, ?, ?, ?)",
+                [user_id, message_id, message_text, timestamp],
             )
-            
-            cursor.execute("SELECT user_id FROM users WHERE business_connection_id = ?", (event.business_connection_id,))
-            user_row = cursor.fetchone()
-
-            if user_row:
-                target_chat = user_row[0]
-            else:
-                target_chat = SUPER_ADMIN_ID
-
-            try:
-                await bot.send_message(chat_id=target_chat, text=report_text, parse_mode="HTML")
-                
-                cursor.execute("""
-                    DELETE FROM business_cache 
-                    WHERE business_connection_id = ? AND chat_id = ? AND message_id = ?
-                """, (event.business_connection_id, event.chat.id, msg_id))
-                conn.commit()
-            except TelegramBadRequest as e:
-                logging.error(f"Не удалось доставить отчет пользователю {target_chat}. Ошибка: {e}")
-                
-    conn.close()
 
 
-@dp.message(Command("admin"), F.from_user.id == SUPER_ADMIN_ID)
-async def cmd_admin(message: Message):
-    """Главный экран панели администратора"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM business_cache")
-    total_cached = cursor.fetchone()[0]
-    conn.close()
+    @staticmethod
+    def get(user_id: int, message_id: int) -> Union[MessageRecord, None]:
+        with sqlite3.connect(Messagesx.PATH_DATABASE) as con:
+            con.row_factory = dict_factory
+            sql = f"SELECT * FROM {Messagesx.storage_name} WHERE user_id = ? AND message_id = ?"
+            response = con.execute(sql, [user_id, message_id]).fetchone()
+            if response is not None:
+                response = MessageRecord(**response)
+            return response
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 Список пользователей", callback_data="admin_list_users")],
-        [InlineKeyboardButton(text="📊 Обновить данные", callback_data="admin_update_stats")]
-    ])
 
-    await message.reply(
-        f"👑 *Панель управления (SaaS режим)*\n\n"
-        f"Зарегистрировано клиентов: `{total_users}`\n"
-        f"Всего сообщений в буфере БД: `{total_cached}`",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
+    @staticmethod
+    def update(user_id: int, message_id: int, **kwargs):
+        with sqlite3.connect(Messagesx.PATH_DATABASE) as con:
+            con.row_factory = dict_factory
+            sql = f"UPDATE {Messagesx.storage_name} SET"
+            sql, parameters = update_format(sql, kwargs)
+            parameters.extend([user_id, message_id])
+            con.execute(sql + " WHERE user_id = ? AND message_id = ?", parameters)
 
-@dp.callback_query(F.data == "admin_list_users", F.from_user.id == SUPER_ADMIN_ID)
-async def process_admin_users(callback: Message):
-    """Вывод списка пользователей с динамическими кнопками бана"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, username, status FROM users LIMIT 10")
-    users = cursor.fetchall()
-    conn.close()
 
-    if not users:
-        await callback.answer("База пользователей пуста.")
-        return
+    @staticmethod
+    def delete(user_id: int, message_id: int):
+        with sqlite3.connect(Messagesx.PATH_DATABASE) as con:
+            con.row_factory = dict_factory
+            sql = f"DELETE FROM {Messagesx.storage_name} WHERE user_id = ? AND message_id = ?"
+            con.execute(sql, [user_id, message_id])
 
-    text = "👤 *Список последних пользователей (Max 10):*\n\n"
-    buttons = []
-    
-    for uid, name, status in users:
-        text += f"• ID: `{uid}` | {name} | Статус: *{status}*\n"
-        if status == 'active':
-            buttons.append([InlineKeyboardButton(text=f"🚫 Забанить {name}", callback_data=f"block_{uid}")])
-        else:
-            buttons.append([InlineKeyboardButton(text=f"✅ Разбанить {name}", callback_data=f"unblock_{uid}")])
 
-    buttons.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="admin_update_stats")])
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    @staticmethod
+    def delete_old_messages(cutoff_timestamp: str):
+        with sqlite3.connect(Messagesx.PATH_DATABASE) as con:
+            sql = f"DELETE FROM {Messagesx.storage_name} WHERE timestamp < ?"
+            con.execute(sql, [cutoff_timestamp])
 
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
 
-@dp.callback_query(F.data.startswith(("block_", "unblock_")), F.from_user.id == SUPER_ADMIN_ID)
-async def handle_ban_unban(callback: Message):
-    """Изменение статуса пользователя в БД"""
-    action, target_id = callback.data.split("_")
-    new_status = "blocked" if action == "block" else "active"
-    
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET status = ? WHERE user_id = ?", (new_status, int(target_id)))
-    
-    if new_status == "blocked":
-        cursor.execute("DELETE FROM business_cache WHERE business_connection_id = ?", (str(target_id),))
-        
-    conn.commit()
-    conn.close()
-    
-    await callback.answer(f"Статус пользователя {target_id} изменен на {new_status}")
-    await process_admin_users(callback)
+class UsersDB:
+    storage_name = "users"
+    PATH_DATABASE = "users.db"
 
-@dp.callback_query(F.data == "admin_update_stats", F.from_user.id == SUPER_ADMIN_ID)
-async def handle_refresh_stats(callback: Message):
-    """Обновление текста главной панели"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM business_cache")
-    total_cached = cursor.fetchone()[0]
-    conn.close()
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 Список пользователей", callback_data="admin_list_users")],
-        [InlineKeyboardButton(text="📊 Обновить данные", callback_data="admin_update_stats")]
-    ])
+    @staticmethod
+    def create_db():
+        with sqlite3.connect(UsersDB.PATH_DATABASE) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''CREATE TABLE IF NOT EXISTS users
+                              (user_id INTEGER PRIMARY KEY, user_fullname TEXT)''')
 
-    await callback.message.edit_text(
-        f"👑 *Панель управления (SaaS режим)*\n\n"
-        f"Зарегистрировано клиентов: `{total_users}`\n"
-        f"Всего сообщений в буфере БД: `{total_cached}`",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
+
+    @staticmethod
+    def add(user_id: int, user_fullname: str):
+        with sqlite3.connect(UsersDB.PATH_DATABASE) as con:
+            con.row_factory = dict_factory
+            con.execute(
+                f"INSERT INTO {UsersDB.storage_name} (user_id, user_fullname) VALUES (?, ?)",
+                [user_id, user_fullname],
+            )
+
+
+    @staticmethod
+    def get(user_id: int) -> Union[dict, None]:
+        with sqlite3.connect(UsersDB.PATH_DATABASE) as con:
+            con.row_factory = dict_factory
+            sql = f"SELECT * FROM {UsersDB.storage_name} WHERE user_id = ?"
+            response = con.execute(sql, [user_id]).fetchone()
+            return response
+
+
+Messagesx.create_db()
+
+UsersDB.create_db()
+
+
+async def cleanup_old_messages():
+    while True:
+        now_local = datetime.now(timezone_local)
+        next_run = now_local.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        sleep_seconds = (next_run - now_local).total_seconds()
+        await asyncio.sleep(sleep_seconds)
+        cutoff_datetime = datetime.now(timezone.utc) - timedelta(days=30)
+        cutoff_timestamp_iso = cutoff_datetime.isoformat()
+        Messagesx.delete_old_messages(cutoff_timestamp_iso)
+
+
+async def send_msg(message_old: str, message_new: Union[str, None], user_fullname: str, user_id: int, timestamp: str, bot: Bot = None):
+    user_fullname_escaped = escape(user_fullname)
+    if message_new is None:
+        msg = DELETED_MESSAGE_FORMAT.format(user_fullname_escaped=user_fullname_escaped, user_id=user_id, timestamp=timestamp, old_text=message_old)
+    else:
+        msg = EDITED_MESSAGE_FORMAT.format(user_fullname_escaped=user_fullname_escaped, user_id=user_id, timestamp=timestamp, old_text=message_old, new_text=message_new)
+    await bot.send_message(USER_ID, msg, parse_mode='html')
+
+
+@router.message(Command(commands=["start"]))
+async def start_command(message: types.Message):
+    user_id = message.from_user.id
+    user_fullname_escaped = escape(message.from_user.full_name)
+    msg = NEW_USER_MESSAGE_FORMAT.format(user_fullname_escaped=user_fullname_escaped, user_id=user_id)
+    await message.answer(msg, parse_mode='html')
+
+
+@router.edited_business_message()
+async def edited_business_message(message: types.Message):
+    if message.from_user.id == message.chat.id:
+        user_msg = Messagesx.get(user_id=message.from_user.id, message_id=message.message_id)
+        if user_msg:
+            message_timestamp = datetime.fromisoformat(user_msg.timestamp).astimezone(timezone_local)
+            timestamp_formatted = message_timestamp.strftime('%d/%m/%y %H:%M')
+            await send_msg(message_old=user_msg.message_text, message_new=message.text, user_fullname=message.from_user.full_name, user_id=message.chat.id, timestamp=timestamp_formatted, bot=message.bot)
+            Messagesx.update(user_id=message.from_user.id, message_id=message.message_id, message_text=message.text)
+
+
+@router.deleted_business_messages()
+async def deleted_business_messages(message: types.Message):
+    user_id = message.chat.id
+    user_fullname = message.chat.full_name
+    for msg_id in message.message_ids:
+        user_msg = Messagesx.get(user_id=user_id, message_id=msg_id)
+        if user_msg:
+            message_timestamp = datetime.fromisoformat(user_msg.timestamp).astimezone(timezone_local)
+            timestamp_formatted = message_timestamp.strftime('%d/%m/%y %H:%M')
+            await send_msg(message_old=user_msg.message_text, message_new=None, user_fullname=user_fullname, user_id=user_id, timestamp=timestamp_formatted, bot=message.bot)
+            Messagesx.delete(user_id=user_id, message_id=msg_id)
+
+
+@router.business_message(F.text)
+async def business_message(message: types.Message):
+    if message.from_user.id == message.chat.id:
+        user_id = message.from_user.id
+        user_fullname = message.from_user.full_name
+        user_fullname_escaped = escape(user_fullname)
+        user_in_db = UsersDB.get(user_id=user_id)
+        if user_in_db is None:
+            UsersDB.add(user_id=user_id, user_fullname=user_fullname)
+            msg = NEW_USER_MESSAGE_FORMAT.format(user_fullname_escaped=user_fullname_escaped, user_id=user_id)
+            await message.bot.send_message(USER_ID, msg, parse_mode='html')
+        message_datetime_utc = message.date.replace(tzinfo=timezone.utc)
+        message_datetime_local = message_datetime_utc.astimezone(timezone_local)
+        timestamp_formatted = message_datetime_local.strftime('%d/%m/%y %H:%M')
+        timestamp_iso = message_datetime_utc.isoformat()
+        Messagesx.add(user_id=user_id, message_id=message.message_id, message_text=message.text, timestamp=timestamp_iso)
+
+
+async def main() -> None:
+    bot = Bot(token=TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
-    logging.info("Бот запущен...")
-    dp.run_polling(bot)
+    asyncio.run(main())
