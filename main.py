@@ -25,14 +25,9 @@ dp = Dispatcher()
 
 
 def init_db():
-    """
-    Создает таблицы. Структура сообщений полностью повторяет логику оригинала,
-    но расширена полем business_connection_id для жесткой изоляции данных пользователей.
-    """
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -41,10 +36,10 @@ def init_db():
         )
     """)
     
-   
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS business_cache (
             business_connection_id TEXT,
+            owner_user_id INTEGER,  -- 🌟 Новое поле для связи
             chat_id INTEGER,
             message_id INTEGER,
             author_name TEXT,
@@ -54,9 +49,6 @@ def init_db():
     """)
     conn.commit()
     conn.close()
-    logging.info("База данных SQLite успешно инициализирована.")
-
-init_db()
 
 
 @dp.message(Command("start"))
@@ -80,10 +72,6 @@ async def cmd_start(message: Message):
 
 @dp.business_message()
 async def handle_incoming_business_message(message: Message):
-    """
-    Сохранение входящих/исходящих сообщений. 
-    Использует INSERT OR REPLACE для фиксации отредактированного текста (как в оригинале).
-    """
     if not message.text:
         return
 
@@ -91,6 +79,12 @@ async def handle_incoming_business_message(message: Message):
     
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+    
+    if message.from_user and message.chat.id == message.from_user.id:
+        cursor.execute("""
+            UPDATE users SET business_connection_id = ? WHERE user_id = ?
+        """, (message.business_connection_id, message.from_user.id))
+
     cursor.execute("""
         INSERT OR REPLACE INTO business_cache (business_connection_id, chat_id, message_id, author_name, text)
         VALUES (?, ?, ?, ?, ?)
@@ -105,7 +99,7 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted):
     cursor = conn.cursor()
 
     for msg_id in event.message_ids:
-        # Ищем сообщение строго по связке сессии, чата и ID сообщения
+
         cursor.execute("""
             SELECT author_name, text FROM business_cache 
             WHERE business_connection_id = ? AND chat_id = ? AND message_id = ?
@@ -116,22 +110,24 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted):
         if result:
             author_name, old_text = result
             
-            # Экранирование Markdown спецсимволов
-            safe_text = old_text.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
+            safe_text = old_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             
             report_text = (
-                f"🗑 *В ВАШЕМ БИЗНЕС-ЧАТЕ УДАЛЕНО СООБЩЕНИЕ!*\n\n"
-                f"👤 *Отправитель:* {author_name}\n"
-                f"🆔 *ID сообщения:* `{msg_id}`\n\n"
-                f"📝 *Текст до удаления:*\n_{safe_text}_"
+                f"🗑 <b>В ВАШЕМ БИЗНЕС-ЧАТЕ УДАЛЕНО СООБЩЕНИЕ!</b>\n\n"
+                f"👤 <b>Отправитель:</b> {author_name}\n"
+                f"🆔 <b>ID сообщения:</b> <code>{msg_id}</code>\n\n"
+                f"📝 <b>Текст до удаления:</b>\n<i>{safe_text}</i>"
             )
             
-            try:
-                if hasattr(event, 'business_connection') and event.business_connection:
-                    target_chat = event.business_connection.user_id
-                else:
-                    target_chat = SUPER_ADMIN_ID 
+            cursor.execute("SELECT user_id FROM users WHERE business_connection_id = ?", (event.business_connection_id,))
+            user_row = cursor.fetchone()
 
+            if user_row:
+                target_chat = user_row[0]
+            else:
+                target_chat = SUPER_ADMIN_ID
+
+            try:
                 await bot.send_message(chat_id=target_chat, text=report_text, parse_mode="HTML")
                 
                 cursor.execute("""
@@ -140,7 +136,7 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted):
                 """, (event.business_connection_id, event.chat.id, msg_id))
                 conn.commit()
             except TelegramBadRequest as e:
-                logging.error(f"Не удалось доставить отчет для бизнес-сессии {event.business_connection_id}. Ошибка: {e}")
+                logging.error(f"Не удалось доставить отчет пользователю {target_chat}. Ошибка: {e}")
                 
     conn.close()
 
@@ -208,7 +204,6 @@ async def handle_ban_unban(callback: Message):
     cursor.execute("UPDATE users SET status = ? WHERE user_id = ?", (new_status, int(target_id)))
     
     if new_status == "blocked":
-        # Стираем накопленный кэш заблокированного человека
         cursor.execute("DELETE FROM business_cache WHERE business_connection_id = ?", (str(target_id),))
         
     conn.commit()
