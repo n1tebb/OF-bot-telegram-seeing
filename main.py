@@ -127,17 +127,20 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted):
             )
             
             try:
-                # Отсылка лога идет строго в бизнес-соединение того пользователя, кто подключил бота
-                await bot.send_message(chat_id=event.business_connection_id, text=report_text, parse_mode="MarkdownV2")
+                if hasattr(event, 'business_connection') and event.business_connection:
+                    target_chat = event.business_connection.user_id
+                else:
+                    target_chat = SUPER_ADMIN_ID 
+
+                await bot.send_message(chat_id=target_chat, text=report_text, parse_mode="HTML")
                 
-                # Точечная очистка кэша, чтобы база не забивала диск
                 cursor.execute("""
                     DELETE FROM business_cache 
                     WHERE business_connection_id = ? AND chat_id = ? AND message_id = ?
                 """, (event.business_connection_id, event.chat.id, msg_id))
                 conn.commit()
-            except TelegramBadRequest:
-                logging.error(f"Не удалось доставить отчет для бизнес-сессии {event.business_connection_id}")
+            except TelegramBadRequest as e:
+                logging.error(f"Не удалось доставить отчет для бизнес-сессии {event.business_connection_id}. Ошибка: {e}")
                 
     conn.close()
 
